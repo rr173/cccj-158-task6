@@ -85,8 +85,11 @@ function fsyncDir(dir) {
 }
 
 export class Wal {
-  constructor(filePath) {
+  constructor(filePath, magic = WAL_MAGIC) {
     this.filePath = filePath;
+    // Every file carries exactly one magic; the outbox log uses its own ('OE')
+    // so a frame can never be mistaken across the two durable logs.
+    this.magic = magic;
     this.fd = null;
     this.fsyncOnAppend = true;
   }
@@ -101,9 +104,23 @@ export class Wal {
   }
 
   append(type, payload) {
-    const frame = encodeFrame(WAL_MAGIC, type, Buffer.from(payload));
+    const frame = encodeFrame(this.magic, type, Buffer.from(payload));
     if (!this.fd) throw new WalError('wal not open');
     fs.writeSync(this.fd, frame, 0, frame.length);
+    fs.fsyncSync(this.fd);
+  }
+
+  /**
+   * Atomically append several frames in one write + fsync. Used by the
+   * transactional outbox: the business frame(s) and the outbox event frame(s)
+   * must land as one durable result, so a crash can never leave a visible
+   * business decision with no corresponding notification.
+   */
+  appendBatch(entries) {
+    if (!this.fd) throw new WalError('wal not open');
+    const buf = Buffer.concat(entries.map(([type, payload]) =>
+      encodeFrame(this.magic, type, Buffer.from(payload))));
+    fs.writeSync(this.fd, buf, 0, buf.length);
     fs.fsyncSync(this.fd);
   }
 
@@ -124,7 +141,7 @@ export class Wal {
       if (e.code === 'ENOENT') return { frames: [], truncatedBytes: 0 };
       throw e;
     }
-    return parseFrames(buf, WAL_MAGIC, { allowTornTail: true });
+    return parseFrames(buf, this.magic, { allowTornTail: true });
   }
 
   /** Backwards-compatible wrapper used by the store. */
@@ -149,7 +166,7 @@ export class Wal {
     const fd = fs.openSync(tmp, 'w');
     try {
       for (const f of frames) {
-        const out = encodeFrame(WAL_MAGIC, f.type, Buffer.from(f.payload));
+        const out = encodeFrame(this.magic, f.type, Buffer.from(f.payload));
         fs.writeSync(fd, out, 0, out.length);
       }
       fs.fsyncSync(fd);

@@ -48,15 +48,71 @@ const POLICY = {
     'POST /api/receipts/verify',
     'GET /api/archive/proofs',
     'GET /api/archive/segments/',
+    'GET /api/subscriptions/proofs',
+  ],
+  // Administrators own the downstream subscription lifecycle (callback
+  // registration, pause/resume, signing-key rotation, dead-letter resend). They
+  // may also read the operational views; the inspector-safe proofs remain the
+  // only thing an inspector can read about notifications.
+  admin: [
+    'GET /api/objects',
+    'GET /api/objects/',
+    'GET /api/cases',
+    'GET /api/cases/',
+    'GET /api/receipts',
+    'GET /api/receipts/',
+    'POST /api/receipts/verify',
+    'GET /api/archive/status',
+    'GET /api/archive/proofs',
+    'GET /api/archive/segments/',
+    'POST /api/subscriptions',
+    'GET /api/subscriptions',
+    'GET /api/subscriptions/',
+    'POST /api/subscriptions/pump',
   ],
 };
+
+/** Exact admin-only mutating actions (beyond the prefix policy). */
+const ADMIN_SUB_ACTIONS = new Set(['pause', 'resume', 'rotate-key', 'redeliver']);
+
+function isAdminSubPath(pathname) {
+  return /^\/api\/subscriptions\/[^/]+\/(pause|resume|rotate-key|redeliver)$/.test(pathname);
+}
+function isInspectorProofPath(pathname) {
+  return pathname === '/api/subscriptions/proofs' ||
+    /^\/api\/subscriptions\/[^/]+\/proofs$/.test(pathname);
+}
 
 function routeAllowed(role, method, pathname) {
   const key = `${method} ${pathname}`;
   if (role === 'inspector' && method === 'GET' && /^\/api\/objects\/[^/]+\/receipts\/download$/.test(pathname)) return true;
   // The raw (identity-bearing) segment dump is operator-only; /pack and /proof
   // are the desensitised inspector-safe routes on the same prefix.
-  if (role !== 'operator' && /^\/api\/archive\/segments\/[^/]+\/raw$/.test(pathname)) return false;
+  if (role !== 'operator' && role !== 'admin' && /^\/api\/archive\/segments\/[^/]+\/raw$/.test(pathname)) return false;
+
+  // Reliable subscriptions:
+  //  - admin manages subscriptions and resends dead letters
+  //  - operator sees only the operational status (read-only)
+  //  - inspector reads only desensitised notification proofs
+  if (pathname.startsWith('/api/subscriptions')) {
+    if (pathname === '/api/subscriptions/pump') return role === 'admin' && method === 'POST';
+    if (pathname === '/api/subscriptions/proofs') return role === 'inspector' && method === 'GET';
+    if (/^\/api\/subscriptions\/[^/]+\/proofs$/.test(pathname)) return role === 'inspector' && method === 'GET';
+    if (isAdminSubPath(pathname)) return role === 'admin' && method === 'POST';
+    if (pathname === '/api/subscriptions') {
+      if (method === 'POST') return role === 'admin';
+      if (method === 'GET') return role === 'admin' || role === 'operator';
+      return false;
+    }
+    if (/^\/api\/subscriptions\/[^/]+$/.test(pathname)) {
+      return method === 'GET' && (role === 'admin' || role === 'operator');
+    }
+    if (/^\/api\/subscriptions\/[^/]+\/items$/.test(pathname)) {
+      return method === 'GET' && role === 'admin';
+    }
+    return false;
+  }
+
   return POLICY[role].some((p) => {
     const [pm, pp] = p.split(' ');
     if (pm !== method) return false;
@@ -113,6 +169,14 @@ function authenticate(req, config) {
 
 async function handleApi(req, res, url, config, store) {
   const auth = authenticate(req, config);
+
+  // Role self-identification for the console: any authenticated token may ask
+  // who it is (needed because admin and operator share most read routes, so the
+  // UI cannot reliably infer the role from a single probe).
+  if (url.pathname === '/api/whoami' && req.method === 'GET') {
+    return sendJson(res, 200, { role: auth.role, reviewer_id: auth.reviewerId, reviewer_name: auth.reviewerName });
+  }
+
   if (!routeAllowed(auth.role, req.method, url.pathname)) {
     throw new ApiError(403, 'ROLE_NOT_PERMITTED', `${auth.role} may not ${req.method} ${url.pathname}`);
   }
@@ -153,6 +217,52 @@ async function handleApi(req, res, url, config, store) {
   }
   if (p === '/api/archive/proofs' && req.method === 'GET') {
     return sendJson(res, 200, { proofs: await store.listProofs() });
+  }
+
+  // --------------------------------------------- reliable subscriptions ----
+  if (p === '/api/subscriptions' && req.method === 'POST') {
+    return sendJson(res, 200, await store.outbox.createSubscription(body));
+  }
+  if (p === '/api/subscriptions' && req.method === 'GET') {
+    return sendJson(res, 200, { subscriptions: await store.outbox.listSubscriptions() });
+  }
+  if (p === '/api/subscriptions/pump' && req.method === 'POST') {
+    // Admin-triggered delivery cycle (deterministic for ops/tests). Runs
+    // entirely outside the business mutex: callbacks can never block the
+    // convergence API.
+    const target = body?.subscription_id || null;
+    const result = target
+      ? await store.outbox.pumpSubscription(target)
+      : (await Promise.all((await store.outbox.pumpAllSubscriptions())));
+    return sendJson(res, 200, target ? result : { results: result });
+  }
+  if (p === '/api/subscriptions/proofs' && req.method === 'GET') {
+    return sendJson(res, 200, { subscriptions: await store.outbox.listProofs() });
+  }
+
+  let subMatch;
+  if ((subMatch = /^\/api\/subscriptions\/([^/]+)\/(pause|resume|rotate-key|redeliver)$/.exec(p)) && req.method === 'POST') {
+    const [, id, action] = subMatch;
+    if (action === 'pause') return sendJson(res, 200, await store.outbox.pauseSubscription(id));
+    if (action === 'resume') return sendJson(res, 200, await store.outbox.resumeSubscription(id));
+    if (action === 'rotate-key') return sendJson(res, 200, await store.outbox.rotateKey(id, body));
+    const eventSeq = body?.event_seq;
+    if (!Number.isInteger(eventSeq)) throw Object.assign(new Error('event_seq required'), {
+      status: 400, code: 'BAD_REQUEST', message: 'event_seq must be an integer', details: undefined,
+    });
+    return sendJson(res, 200, await store.outbox.redeliver(id, eventSeq));
+  }
+  if ((subMatch = /^\/api\/subscriptions\/([^/]+)\/proofs$/.exec(p)) && req.method === 'GET') {
+    const limit = Math.min(500, Number(url.searchParams.get('limit')) || 100);
+    return sendJson(res, 200, { subscription_id: subMatch[1], notifications: await store.outbox.listProofItems(subMatch[1], limit) });
+  }
+  if ((subMatch = /^\/api\/subscriptions\/([^/]+)\/items$/.exec(p)) && req.method === 'GET') {
+    const stateFilter = url.searchParams.get('state') || null;
+    const limit = Math.min(500, Number(url.searchParams.get('limit')) || 100);
+    return sendJson(res, 200, { items: await store.outbox.listItems(subMatch[1], { state: stateFilter, limit }) });
+  }
+  if ((subMatch = /^\/api\/subscriptions\/([^/]+)$/.exec(p)) && req.method === 'GET') {
+    return sendJson(res, 200, await store.outbox.getSubscription(subMatch[1]));
   }
 
   let m;
@@ -247,7 +357,9 @@ function sendJson(res, status, payload) {
 }
 
 function sendError(res, err) {
-  if (err instanceof ApiError) {
+  // Both store.ApiError and outbox.OutboxError carry status/code/details; duck
+  // typing keeps the web layer decoupled from either concrete class.
+  if (err && typeof err.status === 'number' && err.code) {
     return sendJson(res, err.status, { error: { code: err.code, message: err.message, details: err.details } });
   }
   // Never leak internals; log server-side.

@@ -79,6 +79,7 @@
       <option value="reviewer1-token">reviewer-01（一审）</option>
       <option value="reviewer2-token">reviewer-02（二审）</option>
       <option value="inspector-token">inspector（只查脱敏收据）</option>
+      <option value="admin-token">admin（事件订阅管理）</option>
     </select>
   </label>
   <input type="password" id="tokenInput" placeholder="或直接粘贴令牌" style="width:210px" />
@@ -156,6 +157,39 @@
     <section class="panel" id="proofsPanel" hidden>
       <h2>脱敏归档证明</h2>
       <div id="proofsList" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="subsPanel" hidden>
+      <h2 id="subsTitle">下游事件订阅</h2>
+
+      <div id="subsAdminOps">
+        <div class="row">
+          <div><label>回调地址 callback_url</label><input type="text" id="subUrl" placeholder="https://compliance.example/hook" /></div>
+        </div>
+        <label>关注的状态变化（至少一项）</label>
+        <div id="subKinds" class="row" style="flex-wrap:wrap; gap:6px;">
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="decision.created" checked /> 对象新决定 decision.created
+          </label>
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="case.closed" /> 冲突案闭合 case.closed
+          </label>
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="cold_segment.generated" /> 冷段生成 cold_segment.generated
+          </label>
+        </div>
+        <label>签名密钥 signing_key（≥16 字符；旧版本保留用于在途批次验签）</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="subKey" style="flex:1" placeholder="签名密钥，至少 16 字符" />
+          <button class="ghost" type="button" id="genKey">生成</button>
+        </div>
+        <div style="margin-top:10px;">
+          <button id="subCreateBtn" type="button">登记订阅</button>
+          <button class="ghost" type="button" id="subPumpBtn">立即驱动投递</button>
+        </div>
+      </div>
+
+      <div id="subsList" style="margin-top:12px;" class="muted">加载中…</div>
     </section>
 
     <section class="panel" id="detailPanel" hidden>

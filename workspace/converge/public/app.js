@@ -13,6 +13,7 @@ const ROLE_FROM_TOKEN = {
   'reviewer1-token': 'reviewer',
   'reviewer2-token': 'reviewer',
   'inspector-token': 'inspector',
+  'admin-token': 'admin',
 };
 
 function short(h, n = 10) { return typeof h === 'string' ? h.slice(0, n) : h; }
@@ -61,16 +62,22 @@ function applyRole() {
   const isOp = state.role === 'operator';
   const isRev = state.role === 'reviewer';
   const isInsp = state.role === 'inspector';
+  const isAdmin = state.role === 'admin';
   $('submitPanel').hidden = !isOp;
   $('casesPanel').hidden = !isRev;
-  $('receiptsPanel').hidden = !isOp && !isRev && !isInsp;
+  $('receiptsPanel').hidden = !isOp && !isRev && !isInsp && !isAdmin;
   $('objectsHint').hidden = !isInsp;
   $('objectsTable').style.display = isInsp ? 'none' : '';
   // Compression actions are operator-only; reviewers see read-only status;
   // inspectors get only the desensitised proof list.
   $('archiveOps').style.display = isOp ? '' : 'none';
-  $('archivePanel').hidden = !isOp && !isRev;
+  $('archivePanel').hidden = !isOp && !isRev && !isAdmin;
   $('proofsPanel').hidden = !isInsp;
+  // Reliable subscriptions: admin manages, operator views status, inspector
+  // reads only desensitised notification proofs.
+  $('subsPanel').hidden = !isAdmin && !isOp && !isInsp;
+  $('subsAdminOps').style.display = isAdmin ? '' : 'none';
+  $('subsTitle').textContent = isInsp ? '脱敏通知证明' : '下游事件订阅';
   if (isInsp) $('detailPanel').hidden = true;
   refresh();
 }
@@ -84,20 +91,20 @@ $('tokenSelect').addEventListener('change', (e) => {
   localStorage.setItem('converge-role', state.role);
   applyRole();
 });
-$('tokenInput').addEventListener('change', (e) => {
+$('tokenInput').addEventListener('change', async (e) => {
   state.token = e.target.value.trim();
   state.role = '';
-  // Infer role from the objects endpoint permission.
-  api('GET', '/api/objects').then(() => {
-    state.role = state.token.startsWith('reviewer') ? 'reviewer' : 'operator';
-  }).catch(async () => {
-    state.role = 'inspector';
-    try { await api('GET', '/api/receipts'); } catch { state.role = ''; }
-  }).finally(() => {
-    localStorage.setItem('converge-token', state.token);
-    localStorage.setItem('converge-role', state.role);
-    applyRole();
-  });
+  try {
+    // Ask the server for the exact role; admin and operator share read routes,
+    // so inferring from permission probes mis-classifies an admin as operator.
+    const me = await api('GET', '/api/whoami');
+    state.role = me.role;
+  } catch {
+    state.role = '';
+  }
+  localStorage.setItem('converge-token', state.token);
+  localStorage.setItem('converge-role', state.role);
+  applyRole();
 });
 $('refreshBtn').addEventListener('click', refresh);
 
@@ -499,6 +506,137 @@ async function loadProofs() {
   }
 }
 
+// ---------------------------------------------------------- subscriptions ----
+
+function kindTag(k) {
+  const map = { 'decision.created': '对象新决定', 'case.closed': '冲突案闭合', 'cold_segment.generated': '冷段生成' };
+  return map[k] || k;
+}
+
+async function loadSubscriptions() {
+  if (state.role !== 'admin' && state.role !== 'operator') return;
+  try {
+    const { subscriptions } = await api('GET', '/api/subscriptions');
+    if (!subscriptions.length) {
+      $('subsList').innerHTML = '<p class="muted">尚无下游订阅。</p>';
+      return;
+    }
+    $('subsList').innerHTML = subscriptions.map((s) => {
+      const statusTag = s.status === 'active' ? '<span class="tag settled">active</span>'
+        : s.status === 'paused' ? '<span class="tag suspended">paused</span>'
+        : `<span class="tag pending">${esc(s.status)}</span>`;
+      const isAdmin = state.role === 'admin';
+      const deadRows = (s.dead_letter || []).map((d) => `
+        <div class="err mono" style="margin-top:4px">
+          死信 #${d.event_seq} ${esc(short(d.event_id, 14))} · 尝试 ${d.attempts} · ${esc(d.last_error || '')}
+          ${isAdmin ? `<button class="ghost sub-redeliver" data-id="${esc(s.id)}" data-seq="${d.event_seq}" style="margin-left:8px; padding:2px 8px;">再次发送</button>` : ''}
+        </div>`).join('');
+      return `<div class="candidate" data-sub="${esc(s.id)}">
+        <div><b class="mono">${esc(short(s.id, 18))}</b> ${statusTag}
+          <span class="muted">密钥 v${s.current_key_version}</span></div>
+        <div class="mono muted" style="word-break:break-all">${esc(s.callback_url)}</div>
+        <div class="muted">关注：${s.event_kinds.map(kindTag).join('、')}</div>
+        <div style="margin-top:4px">
+          待发送 <b>${s.pending_count}</b> · 在途 ${s.in_flight_count} · 死信 <b class="${s.dead_count ? 'err' : ''}">${s.dead_count}</b>
+          · 最近确认游标 <b class="mono">#${s.confirmed_event_seq}</b>
+        </div>
+        ${s.last_acked ? `<div class="muted mono">最近确认：${esc(short(s.last_acked.event_id, 14))} (${esc(s.last_acked.kind)}) @ ${esc(s.last_acked.confirmed_at)}</div>` : ''}
+        ${deadRows}
+        ${isAdmin ? `<div style="margin-top:8px; display:flex; gap:6px;">
+          <button class="ghost sub-pause" data-id="${esc(s.id)}" type="button">暂停</button>
+          <button class="ghost sub-resume" data-id="${esc(s.id)}" type="button">恢复</button>
+          <button class="ghost sub-rotate" data-id="${esc(s.id)}" type="button">更换签名密钥</button>
+        </div>` : ''}
+      </div>`;
+    }).join('');
+
+    if (state.role === 'admin') {
+      document.querySelectorAll('.sub-pause').forEach((b) => b.onclick = async () => {
+        try { await api('POST', `/api/subscriptions/${b.dataset.id}/pause`, {}); toast('已暂停', 'ok'); loadSubscriptions(); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+      document.querySelectorAll('.sub-resume').forEach((b) => b.onclick = async () => {
+        try { await api('POST', `/api/subscriptions/${b.dataset.id}/resume`, {}); toast('已恢复', 'ok'); loadSubscriptions(); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+      document.querySelectorAll('.sub-rotate').forEach((b) => b.onclick = async () => {
+        const key = (crypto.randomUUID?.() || ('k' + Math.random().toString(36).slice(2) + Date.now().toString(36))) +
+          '-' + Math.random().toString(36).slice(2, 12);
+        if (!confirm('为该订阅生成并更换为新的签名密钥版本？\n（在途批次继续使用旧版本）')) return;
+        try { await api('POST', `/api/subscriptions/${b.dataset.id}/rotate-key`, { signing_key: key }); toast('签名密钥已更换为新版本', 'ok'); loadSubscriptions(); }
+        catch (e) { toast(e.message, 'err'); }
+      });
+      document.querySelectorAll('.sub-redeliver').forEach((b) => b.onclick = async () => {
+        try {
+          await api('POST', `/api/subscriptions/${b.dataset.id}/redeliver`, { event_seq: Number(b.dataset.seq) });
+          toast('已重新入队（原事件标识与顺序不变）', 'ok'); loadSubscriptions();
+        } catch (e) { toast(e.message, 'err'); }
+      });
+    }
+  } catch (e) {
+    $('subsList').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+
+async function loadSubProofs() {
+  if (state.role !== 'inspector') return;
+  try {
+    const { subscriptions } = await api('GET', '/api/subscriptions/proofs');
+    if (!subscriptions.length) { $('subsList').innerHTML = '<p class="muted">尚无订阅通知证明。</p>'; return; }
+    $('subsList').innerHTML = subscriptions.map((s) => `
+      <div class="candidate">
+        <b class="mono">${esc(short(s.id, 18))}</b>
+        <span class="tag ${s.status === 'active' ? 'settled' : 'suspended'}">${esc(s.status)}</span>
+        <div class="muted">关注：${s.event_kinds.map(kindTag).join('、')}</div>
+        <div style="margin-top:4px">待发送 ${s.pending_count} · 在途 ${s.in_flight_count} · 死信 ${s.dead_count}
+          · 最近确认游标 <b class="mono">#${s.confirmed_event_seq}</b></div>
+        ${s.last_acked ? `<div class="muted mono">最近确认事件 ${esc(short(s.last_acked.event_id, 14))} (${esc(s.last_acked.kind)}) @ ${esc(s.last_acked.confirmed_at)}</div>` : ''}
+        <div style="margin-top:6px"><a href="/api/subscriptions/${encodeURIComponent(s.id)}/proofs" class="sub-proof" data-id="${esc(s.id)}">查看脱敏通知证明（JSON）</a></div>
+      </div>`).join('');
+    document.querySelectorAll('.sub-proof').forEach((a) => a.addEventListener('click', (e) => {
+      e.preventDefault();
+      fetch(a.href, { headers: { Authorization: `Bearer ${state.token}` } })
+        .then(async (x) => { if (!x.ok) throw new Error('HTTP ' + x.status + ' ' + await x.text()); return x.text(); })
+        .then((txt) => {
+          const pre = document.createElement('pre');
+          pre.textContent = txt;
+          const w = window.open('', '_blank');
+          if (w) { w.document.body.style.background = '#0f1420'; w.document.body.style.color = '#e6ebf5'; w.document.body.appendChild(pre); }
+        }).catch((err) => toast('证明读取失败：' + err.message, 'err'));
+    }));
+  } catch (e) {
+    $('subsList').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+
+$('genKey')?.addEventListener('click', () => {
+  $('subKey').value = (crypto.randomUUID?.() || ('k' + Math.random().toString(36).slice(2))) +
+    '-' + Math.random().toString(36).slice(2, 14);
+});
+$('subCreateBtn')?.addEventListener('click', async () => {
+  const url = $('subUrl').value.trim();
+  const key = $('subKey').value.trim();
+  const event_kinds = [...document.querySelectorAll('#subKinds input:checked')].map((c) => c.value);
+  if (!url) return toast('请填写回调地址', 'err');
+  if (!key || key.length < 16) return toast('签名密钥至少 16 字符', 'err');
+  if (!event_kinds.length) return toast('请至少选择一种关注事件', 'err');
+  try {
+    const r = await api('POST', '/api/subscriptions', { callback_url: url, event_kinds, signing_key: key });
+    toast('订阅已登记：' + r.id, 'ok');
+    $('subUrl').value = ''; $('subKey').value = '';
+    loadSubscriptions();
+  } catch (e) { toast(e.message + (e.payload?.error?.details ? ' ' + JSON.stringify(e.payload.error.details) : ''), 'err'); }
+});
+$('subPumpBtn')?.addEventListener('click', async () => {
+  try {
+    const r = await api('POST', '/api/subscriptions/pump', {});
+    const rs = r.results || [];
+    const acked = rs.reduce((a, x) => a + (x.acked || 0), 0);
+    toast(`投递周期完成：确认 ${acked} 条`, 'ok');
+    loadSubscriptions();
+  } catch (e) { toast(e.message, 'err'); }
+});
+
 // ------------------------------------------------------------------- boot ---
 
 function refresh() {
@@ -508,6 +646,8 @@ function refresh() {
   loadReceipts();
   loadArchiveStatus();
   loadProofs();
+  loadSubscriptions();
+  loadSubProofs();
 }
 if (state.token) {
   $('tokenSelect').value = state.token.startsWith('reviewer') || ROLE_FROM_TOKEN[state.token] ? state.token : '';

@@ -3,6 +3,9 @@ import { Wal } from './wal.mjs';
 import { Mutex } from './mutex.mjs';
 import { canonical, digestOf, sha256Hex, sign } from './crypto-util.mjs';
 import { ArchiveManager, ArchiveError, isFsPermissionError } from './archive.mjs';
+import {
+  OutboxManager, T_OUTBOX_EVENT, eventIds,
+} from './outbox.mjs';
 
 export class ApiError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -49,6 +52,7 @@ export class ConvergenceStore {
     this.wal = new Wal(config.walPath);
     this.lock = new Mutex();
     this.archive = new ArchiveManager(config);
+    this.outbox = new OutboxManager(config, this.wal);
 
     this.nodes = new Map(); // digest -> node
     this.objects = new Map(); // objectKey -> object state
@@ -83,6 +87,9 @@ export class ConvergenceStore {
       const total = fs.statSync(this.config.walPath).size;
       this.wal.truncate(total - truncatedBytes);
     }
+    // The outbox log is opened before replay so fan-out items survive a crash
+    // between a business+event batch commit and the fan-out append.
+    this.outbox.open();
     for (const ev of events) this._replayEvent(ev.type, ev.payload);
 
     this._loadSegments();
@@ -90,11 +97,19 @@ export class ConvergenceStore {
     this._pruneHotToCold();
     this._rebuildDerived();
     this._recoverSettlements();
+
+    // Transactional-outbox reconciliation: deterministically close any
+    // "business durable, event missing" gap and fan events out to every
+    // subscription. Descriptors are emitted in WAL append order so new event
+    // seqs preserve business order.
+    this.outbox.reconcile(this._outboxEventDescriptors());
+    this.outbox.startPump();
   }
 
   close() {
     for (const t of this._timers.values()) clearTimeout(t);
     this._timers.clear();
+    this.outbox.close();
     this.wal.close();
   }
 
@@ -108,6 +123,11 @@ export class ConvergenceStore {
     if (type === T_RESTORED) {
       const wrap = JSON.parse(payloadBuf.toString('utf8'));
       for (const e of wrap.events || []) this._replay(e.t, Buffer.from(e.p, 'utf8'));
+      return;
+    }
+    if (type === T_OUTBOX_EVENT) {
+      // Durable notification log: rebuild global event seq authority.
+      this.outbox.indexReplayedEvent(JSON.parse(payloadBuf.toString('utf8')));
       return;
     }
     this._replay(type, payloadBuf);
@@ -384,6 +404,12 @@ export class ConvergenceStore {
             }));
           if (allCovered) continue;
         }
+        keep.push({ type: f.type, payload: f.payload });
+        continue;
+      }
+      if (f.type === T_OUTBOX_EVENT) {
+        // The global notification log + per-subscription seq authority: it is
+        // never part of graph/cold ancestry and must survive every hot trim.
         keep.push({ type: f.type, payload: f.payload });
         continue;
       }
@@ -867,6 +893,7 @@ export class ConvergenceStore {
     }
 
     const seq = (this.receiptSeq.get(objectKey) || 0) + 1;
+    const occurredAt = nowIso();
     const receiptFields = {
       seq,
       object_key: objectKey,
@@ -878,12 +905,25 @@ export class ConvergenceStore {
         ? { case_id: adjudication.caseId, reviewers: adjudication.reviewerNames }
         : {}),
       prev_receipt: obj.currentReceipt,
-      emitted_at: nowIso(),
+      emitted_at: occurredAt,
     };
     const hash = digestOf(receiptFields);
     const receipt = { ...receiptFields, hash, sig: sign(this.config.receiptSecret, receiptFields) };
 
-    this.wal.append(T_DECISION, JSON.stringify({ node, receipt }));
+    // Transactional outbox: the business decision frame and its notification
+    // event(s) are ONE durable batch. An adjudication that closes a conflict
+    // produces a decision.created event AND a case.closed event in the same
+    // batch (same persisted result, no notification gap either way).
+    const eventDescriptors = [this._decisionEventDescriptor(receipt, occurredAt)];
+    if (adjudication) {
+      eventDescriptors.push(this._caseClosedEventDescriptor(
+        adjudication.caseId, receipt, occurredAt));
+    }
+    this.outbox.appendWithBusiness(
+      [[T_DECISION, JSON.stringify({ node, receipt })]],
+      eventDescriptors,
+    );
+
     this.nodes.set(node.digest, node);
     this.receipts.set(hash, receipt);
     this.receiptSeq.set(objectKey, seq);
@@ -896,6 +936,48 @@ export class ConvergenceStore {
       obj.openCaseId = null;
     }
     return node;
+  }
+
+  _decisionEventDescriptor(receipt, occurredAt) {
+    return {
+      kind: 'decision.created',
+      event_id: eventIds.decisionCreated(receipt.hash),
+      object_key: receipt.object_key,
+      business_cursor: {
+        object_key: receipt.object_key,
+        receipt_seq: receipt.seq,
+        receipt_hash: receipt.hash,
+        decision_node: receipt.decision_node,
+        prev_receipt: receipt.prev_receipt,
+      },
+      occurred_at: occurredAt,
+      data: {
+        decision_kind: receipt.decision_kind,
+        contributions: receipt.contributions,
+        ...(receipt.case_id ? { case_id: receipt.case_id } : {}),
+      },
+    };
+  }
+
+  _caseClosedEventDescriptor(caseId, receipt, occurredAt) {
+    return {
+      kind: 'case.closed',
+      event_id: eventIds.caseClosed(caseId, receipt.hash),
+      object_key: receipt.object_key,
+      business_cursor: {
+        object_key: receipt.object_key,
+        receipt_seq: receipt.seq,
+        receipt_hash: receipt.hash,
+        decision_node: receipt.decision_node,
+        case_id: caseId,
+      },
+      occurred_at: occurredAt,
+      data: {
+        case_id: caseId,
+        decision_kind: receipt.decision_kind,
+        decision_node: receipt.decision_node,
+      },
+    };
   }
 
   _receiptByNode(nodeDigest) {
@@ -1134,6 +1216,62 @@ export class ConvergenceStore {
     }
   }
 
+  // ------------------------------------------------- outbox reconciliation --
+
+  /**
+   * Enumerate every business moment that must have a notification, in business
+   * WAL append order:
+   *   - each decision frame -> decision.created (+ case.closed for adjudicates)
+   *   - each checkpoint stub -> cold_segment.generated
+   * Outbox event frames are the durable mirror; reconcile() appends any mirror
+   * entry that is missing (closing a crash gap) and idempotently fans out.
+   *
+   * Scanning the raw WAL in file order (rather than in-memory maps) means a
+   * recovered order matches the original append order even after a hot trim.
+   */
+  _outboxEventDescriptors() {
+    const descriptors = [];
+    const { frames } = this.wal.readAllFrames();
+    for (const f of frames) {
+      let parsed;
+      try { parsed = JSON.parse(f.payload.toString('utf8')); } catch { continue; }
+      if (f.type === T_DECISION) {
+        const { receipt } = parsed;
+        if (!receipt) continue;
+        descriptors.push(this._decisionEventDescriptor(receipt, receipt.emitted_at));
+        if (receipt.decision_kind === 'adjudicate' && receipt.case_id) {
+          descriptors.push(this._caseClosedEventDescriptor(receipt.case_id, receipt, receipt.emitted_at));
+        }
+      } else if (f.type === T_CHECKPOINT) {
+        const stub = parsed;
+        descriptors.push({
+          kind: 'cold_segment.generated',
+          event_id: eventIds.coldSegment(stub.segment_id),
+          object_key: stub.object_key,
+          business_cursor: {
+            object_key: stub.object_key,
+            boundary_receipt_seq: stub.boundary_seq,
+            boundary_receipt_hash: stub.boundary_receipt?.hash || null,
+            segment_id: stub.segment_id,
+          },
+          occurred_at: stub.created_at,
+          data: {
+            segment_id: stub.segment_id,
+            chain_anchor: stub.chain_anchor,
+            boundary_receipt_seq: stub.boundary_seq,
+            content_digest: null,
+            archived_frames: (stub.archived_nodes || []).length,
+          },
+        });
+      }
+    }
+    // Decisions restored from cold storage (T_RESTORED wrappers) are separate
+    // frames that predate this process: their decision.created event was emitted
+    // when they were first produced and survives in the (trimmed) event log, so
+    // they are intentionally not enumerated here.
+    return descriptors;
+  }
+
   // =============================================================== CHECKPOINTS
 
   async createCheckpoint(rawBody) {
@@ -1330,7 +1468,32 @@ export class ConvergenceStore {
 
     // The stub append is the durable commit point: after it lands, the trim must
     // complete even if the process exits — startup recovery finishes the job.
-    this.wal.append(T_CHECKPOINT, JSON.stringify(stub));
+    // The cold_segment.generated notification is part of the SAME durable
+    // batch, so an archived segment is never silently unannounced.
+    const coldOccurredAt = stub.created_at;
+    const coldDescriptor = {
+      kind: 'cold_segment.generated',
+      event_id: eventIds.coldSegment(segmentId),
+      object_key: key,
+      business_cursor: {
+        object_key: key,
+        boundary_receipt_seq: target,
+        boundary_receipt_hash: boundaryReceipt.hash,
+        segment_id: segmentId,
+      },
+      occurred_at: coldOccurredAt,
+      data: {
+        segment_id: segmentId,
+        chain_anchor: stub.chain_anchor,
+        boundary_receipt_seq: target,
+        content_digest: this.archive.get(segmentId)?.content_digest || null,
+        archived_frames: selected.length,
+      },
+    };
+    this.outbox.appendWithBusiness(
+      [[T_CHECKPOINT, JSON.stringify(stub)]],
+      [coldDescriptor],
+    );
     this.archive.updateTaskMarker(taskId, { phase: 'VERIFIED' });
     this._indexCheckpointStub(stub);
 
