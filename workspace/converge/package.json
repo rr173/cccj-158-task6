@@ -8,6 +8,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "verify": "node scripts/verify.mjs",
-    "verify:archive": "node scripts/verify-archive.mjs"
+    "verify:archive": "node scripts/verify-archive.mjs",
+    "verify:notify": "node scripts/verify-notify.mjs",
+    "verify:all": "node scripts/verify.mjs && node scripts/verify-archive.mjs && node scripts/verify-notify.mjs"
   }
 }

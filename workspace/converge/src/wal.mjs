@@ -107,6 +107,25 @@ export class Wal {
     fs.fsyncSync(this.fd);
   }
 
+  /**
+   * Atomically append several frames with ONE write and ONE fsync. This is the
+   * transactional-outbox commit point: a business frame (decision / checkpoint
+   * stub) and the notification frames it produces either all land together or
+   * none of them do. A crash inside the write leaves at most a torn tail that
+   * startup truncates, so the business can never commit without its events
+   * sitting durably in the inbox (startup reconciliation closes the residual
+   * crash-after-commit window by re-enqueuing from the already-durable fact).
+   */
+  appendMany(entries) {
+    if (!entries.length) return;
+    const bufs = entries.map(({ type, payload }) =>
+      encodeFrame(WAL_MAGIC, type, Buffer.from(payload)));
+    if (!this.fd) throw new WalError('wal not open');
+    const out = bufs.length === 1 ? bufs[0] : Buffer.concat(bufs);
+    fs.writeSync(this.fd, out, 0, out.length);
+    fs.fsyncSync(this.fd);
+  }
+
   close() {
     if (this.fd) {
       try { fs.fsyncSync(this.fd); } catch { /* ignore on close */ }

@@ -13,6 +13,7 @@ const ROLE_FROM_TOKEN = {
   'reviewer1-token': 'reviewer',
   'reviewer2-token': 'reviewer',
   'inspector-token': 'inspector',
+  'admin-token': 'admin',
 };
 
 function short(h, n = 10) { return typeof h === 'string' ? h.slice(0, n) : h; }
@@ -61,6 +62,7 @@ function applyRole() {
   const isOp = state.role === 'operator';
   const isRev = state.role === 'reviewer';
   const isInsp = state.role === 'inspector';
+  const isAdmin = state.role === 'admin';
   $('submitPanel').hidden = !isOp;
   $('casesPanel').hidden = !isRev;
   $('receiptsPanel').hidden = !isOp && !isRev && !isInsp;
@@ -71,6 +73,11 @@ function applyRole() {
   $('archiveOps').style.display = isOp ? '' : 'none';
   $('archivePanel').hidden = !isOp && !isRev;
   $('proofsPanel').hidden = !isInsp;
+  // Subscription management: admin manages, operator reads status, inspector
+  // only reads desensitised notification proofs.
+  $('subsPanel').hidden = !isAdmin && !isOp;
+  $('subsAdminOps').style.display = isAdmin ? '' : 'none';
+  $('notifyProofsPanel').hidden = !isInsp && !isAdmin;
   if (isInsp) $('detailPanel').hidden = true;
   refresh();
 }
@@ -87,6 +94,13 @@ $('tokenSelect').addEventListener('change', (e) => {
 $('tokenInput').addEventListener('change', (e) => {
   state.token = e.target.value.trim();
   state.role = '';
+  if (ROLE_FROM_TOKEN[state.token]) {
+    state.role = ROLE_FROM_TOKEN[state.token];
+    localStorage.setItem('converge-token', state.token);
+    localStorage.setItem('converge-role', state.role);
+    applyRole();
+    return;
+  }
   // Infer role from the objects endpoint permission.
   api('GET', '/api/objects').then(() => {
     state.role = state.token.startsWith('reviewer') ? 'reviewer' : 'operator';
@@ -499,6 +513,156 @@ async function loadProofs() {
   }
 }
 
+// ----------------------------------------------------------- subscriptions --
+
+const SUB_EVENTS = ['decision.created', 'conflict.closed', 'cold_segment.generated'];
+let subExpanded = null;
+
+function tagForStatus(s) {
+  const cls = s === 'active' ? 'settled' : 'pending';
+  return `<span class="tag ${cls}">${esc(s)}</span>`;
+}
+
+async function loadSubscriptions() {
+  if (state.role !== 'admin' && state.role !== 'operator') return;
+  const box = $('subsList');
+  try {
+    const { subscriptions } = await api('GET', '/api/subscriptions');
+    if (!subscriptions.length) { box.innerHTML = '<p class="muted">尚无订阅。</p>'; return; }
+    box.innerHTML = subscriptions.map((s) => `
+      <div class="candidate" data-id="${esc(s.id)}">
+        <div style="display:flex; gap:8px; align-items:center;">
+          <b>${esc(s.name)}</b> ${tagForStatus(s.status)}
+          <span class="muted mono">${esc(short(s.id, 16))}</span>
+          <span style="flex:1"></span>
+          <span class="muted">待发送 ${s.backlog_count} · 死信 ${s.dead_count} · 最近确认游标 ${s.last_acked_cursor}</span>
+        </div>
+        <div class="mono muted" style="word-break:break-all">${esc(s.callback_url)}</div>
+        <div class="muted">关注：${s.events.map(esc).join('、')} · 当前密钥 <b>${esc(s.current_key_version)}</b>（${s.key_versions.length} 个版本）</div>
+        ${state.role === 'admin' ? `
+        <div style="margin-top:6px" class="sub-actions">
+          <button class="ghost sub-pause" type="button">暂停</button>
+          <button class="ghost sub-resume" type="button">恢复</button>
+          <button class="ghost sub-rotate" type="button">更换签名密钥</button>
+          <button class="ghost sub-detail" type="button">详情/死信</button>
+        </div>` : '<div class="muted" style="margin-top:4px">操作员只读视图</div>'}
+        <div class="sub-body" hidden></div>
+      </div>`).join('');
+    box.querySelectorAll('.candidate').forEach((el) => {
+      const id = el.dataset.id;
+      const sub = subscriptions.find((x) => x.id === id);
+      el.querySelector('.sub-pause')?.addEventListener('click', () => subAction(id, 'pause'));
+      el.querySelector('.sub-resume')?.addEventListener('click', () => subAction(id, 'resume'));
+      el.querySelector('.sub-rotate')?.addEventListener('click', () => rotateKey(id));
+      el.querySelector('.sub-detail')?.addEventListener('click', () => toggleSubDetail(el, id));
+    });
+  } catch (e) {
+    box.innerHTML = `<p class="err">${esc(e.message)}</p>`;
+  }
+}
+
+async function subAction(id, action) {
+  try {
+    const r = await api('POST', `/api/subscriptions/${encodeURIComponent(id)}/${action}`);
+    toast(`订阅已${action === 'pause' ? '暂停' : '恢复'}（已出箱批次密钥版本不变）`, 'ok');
+    loadSubscriptions();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function rotateKey(id) {
+  try {
+    const r = await api('POST', `/api/subscriptions/${encodeURIComponent(id)}/rotate-key`, {});
+    toast(`密钥已更换为 ${r.current_key_version}（新批次生效；旧批次沿用旧版本）`, 'ok');
+    loadSubscriptions();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+$('subCreateBtn').addEventListener('click', async () => {
+  const events = [];
+  if ($('evDecision').checked) events.push('decision.created');
+  if ($('evConflict').checked) events.push('conflict.closed');
+  if ($('evCold').checked) events.push('cold_segment.generated');
+  const body = {
+    name: $('subName').value.trim(),
+    callback_url: $('subUrl').value.trim(),
+    events,
+  };
+  if (!body.name || !body.callback_url) { toast('名称与回调地址必填', 'err'); return; }
+  if (!events.length) { toast('至少选择一个事件种类', 'err'); return; }
+  try {
+    const r = await api('POST', '/api/subscriptions', body);
+    const pre = $('subCreateResult');
+    pre.hidden = false;
+    pre.textContent = JSON.stringify({
+      id: r.id, status: r.status, current_key_version: r.current_key_version,
+      signing_secret: r.signing_secret,
+      note: '签名密钥仅本次返回，请妥善保存；可用于校验 x-convergence-signature。',
+    }, null, 2);
+    toast('订阅已登记（密钥只展示这一次）', 'ok');
+    loadSubscriptions();
+  } catch (e) { toast(e.message + (e.payload?.error?.details ? ' ' + JSON.stringify(e.payload.error.details) : ''), 'err'); }
+});
+
+async function toggleSubDetail(el, id) {
+  const body = el.querySelector('.sub-body');
+  if (!body.hidden) { body.hidden = true; return; }
+  body.hidden = false;
+  body.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('GET', '/api/subscriptions/' + encodeURIComponent(id));
+    const dead = (d.dead_letters || []).map((x) => `
+      <div class="candidate">
+        <div><b>死信</b> <span class="mono">${esc(short(x.delivery_id, 18))}</span> · 游标 ${x.cursor} · ${esc(x.kind)} · ${esc(x.object_key)}</div>
+        <div class="muted">原因：${esc(x.dead_reason || '—')} · 尝试 ${x.attempts} 次 · 密钥 ${esc(x.key_version)}</div>
+        <button class="ghost sub-resend" type="button" data-d="${esc(x.delivery_id)}">人工再次发送（沿用原事件标识与顺序）</button>
+      </div>`).join('') || '<div class="muted">无死信。</div>';
+    const pending = (d.pending || []).slice(-20).map((x) =>
+      `<tr><td class="mono">${esc(short(x.delivery_id, 14))}</td><td>${x.cursor}</td><td>${esc(x.status)}</td><td>${x.attempts}</td><td class="mono">${esc(short(x.last_error || '', 40))}</td></tr>`).join('');
+    body.innerHTML = `
+      <div style="margin-top:8px">
+        <b>最近确认</b>：游标 ${d.last_acked_cursor}
+        ${d.last_ack ? `<span class="muted mono">（事件 ${esc(short(d.last_ack.event_id, 16))} @ ${esc(d.last_ack.at)})</span>` : ''}
+      </div>
+      <table style="margin-top:6px"><thead><tr><th>投递</th><th>游标</th><th>状态</th><th>尝试</th><th>最后错误</th></tr></thead><tbody>${pending || '<tr><td colspan="5" class="muted">无待发送</td></tr>'}</tbody></table>
+      <div style="margin-top:8px"><b>死信</b></div>${dead}`;
+    body.querySelectorAll('.sub-resend').forEach((b) => b.addEventListener('click', async () => {
+      try {
+        await api('POST', `/api/subscriptions/deliveries/${encodeURIComponent(b.dataset.d)}/resend`);
+        toast('已再次发送：保持原事件标识、原业务顺序', 'ok');
+        loadSubscriptions();
+      } catch (e) { toast(e.message, 'err'); }
+    }));
+  } catch (e) { body.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+}
+
+// ---------------------------------------------------- notification proofs ----
+
+async function loadNotifyProofs() {
+  if (state.role !== 'inspector' && state.role !== 'admin') return;
+  const box = $('notifyProofsList');
+  if (!box) return;
+  const key = $('notifyFilter').value.trim();
+  try {
+    const { proofs } = await api('GET', '/api/subscriptions/events' + (key ? '?object_key=' + encodeURIComponent(key) : ''));
+    if (!proofs.length) { box.innerHTML = '<p class="muted">尚无通知证明。</p>'; return; }
+    box.innerHTML = `<table><thead><tr><th>事件标识</th><th>对象</th><th>种类</th><th>业务游标</th><th>订阅游标</th><th>密钥</th><th>状态</th></tr></thead><tbody>
+      ${proofs.slice(0, 200).map((p) => `<tr>
+        <td class="mono">${esc(short(p.event_id, 18))}</td>
+        <td class="mono">${esc(p.object_key)}</td>
+        <td>${esc(p.kind)}</td>
+        <td>${p.cursor}</td>
+        <td>${p.delivery_cursor}</td>
+        <td>${esc(p.key_version)}</td>
+        <td>${esc(p.status)}${p.last_error ? `<div class="err mono">${esc(short(p.last_error, 40))}</div>` : ''}</td>
+      </tr>`).join('')}
+    </tbody></table>
+    <p class="muted">脱敏视图：不含回调地址、订阅名、签名密钥、站点标识、请求键或图像内容。</p>`;
+  } catch (e) {
+    box.innerHTML = `<p class="err">${esc(e.message)}</p>`;
+  }
+}
+$('loadNotifyProofs')?.addEventListener('click', loadNotifyProofs);
+
 // ------------------------------------------------------------------- boot ---
 
 function refresh() {
@@ -508,6 +672,8 @@ function refresh() {
   loadReceipts();
   loadArchiveStatus();
   loadProofs();
+  loadSubscriptions();
+  loadNotifyProofs();
 }
 if (state.token) {
   $('tokenSelect').value = state.token.startsWith('reviewer') || ROLE_FROM_TOKEN[state.token] ? state.token : '';

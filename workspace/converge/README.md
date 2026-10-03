@@ -55,6 +55,8 @@ CONVERGE_RETAIN_DECISIONS=2 npm start
 ```bash
 npm run verify          # 既有 62 项汇合/判定/崩溃/RBAC/篡改场景
 npm run verify:archive  # 归档 96 项（见上“可验证的历史压缩与冷归档”）
+npm run verify:notify   # 事件订阅 94 项（见上“可靠事件订阅”）
+npm run verify:all      # 以上三套顺序执行
 ```
 
 `verify` 启动真实 HTTP 服务（临时端口 + 临时数据目录），覆盖：
@@ -69,6 +71,48 @@ npm run verify:archive  # 归档 96 项（见上“可验证的历史压缩与�
 8. 崩溃续办：WAL 尾帧残缺（落盘中途被 kill）自动截断续跑；在“二审已 fsync、决定尚未落盘”窗口崩溃，重启后补出**唯一**决定；再次重启不重复
 9. WAL 中段被篡改 → 服务**拒绝启动**（不静默跳过已提交事件）
 
+## 向下游合规系统的可靠事件订阅
+
+管理员可登记回调地址、选择关注的事件种类并设置（可轮换的）签名密钥；对象**产生新决定、冲突案闭合或冷段生成**时，业务帧与事件帧在**同一次写入、同一次 fsync** 落进同一条 WAL——业务提交与事件入箱是**同一个持久化结果**。启动时再对全部持久化业务事实做一次对账，若发现“事实已在、事件缺失”的残余崩溃窗口立即补箱，从结构上杜绝“业务已生效却永远没有通知”的空档。
+
+| 关注点 | 机制 |
+| --- | --- |
+| 通知内容 | 仅含**稳定事件标识**（`ev_<digest>`，按事实确定性派生）、**对象替代键** `object_key`、事件种类、**业务游标**（决定=回执 `seq`，冷段=边界 `boundary_receipt_seq`）、发生时间与 **HMAC 签名**；**绝不含**站点标识、请求键、站点序号或图像摘要/内容 |
+| 签名 | 每批入箱绑定创建当时的**密钥版本**（`v1/v2/…`，旧密钥永久保留可重签）；暂停/恢复/换钥不影响已出箱批次，新批次用当前版本；回调头 `X-Convergence-Signature/Key/Event/Cursor/…` 与正文一致 |
+| 每订阅确认游标 | 订阅各自维护从 1 开始的投递游标；发送器只发该订阅**游标最小的未确认行**（队头优先），死信行阻塞其后所有行直到人工再发送——游标**不倒退、不跳过未确认事件**；接收方凭稳定事件标识即可去重 |
+| 重试与死信 | 超时/非 2xx 按**有上限指数退避**（默认 base 200ms、上限 30s、最多 5 次，均可由环境变量配置）；达上限进死信并记录原因；人工再次发送沿用**原事件标识、原业务顺序**，尝试计数清零重新入队 |
+| 确认丢失 | 响应丢失/进程在确认落盘前中断只会**重复投递**同一稳定标识；HTTP I/O 全部在进程锁外，回调再慢也不阻塞汇合请求与历史查询，落盘仅占极短临界区 |
+| 暂停/恢复 | 暂停期间事件照常入箱积压、一条不发；恢复后严格按业务顺序刷出 |
+| 进程恢复 | 订阅、密钥史、待发送、确认游标、死信全部为 WAL 帧，重启逐帧重建；崩溃时处于 `sending` 的行安全重投（至多重复） |
+| 角色边界 | **admin** 登记/暂停/恢复/换钥/查看/死信再发送；**operator** 只读订阅状态、待发送数量、最近确认游标与死信原因；**inspector** 只能读/校验**脱敏通知证明**（无回调地址、订阅名、密钥、站点/请求键、响应错误文本） |
+| 不阻塞业务 | 通知故障（回调宕机、死信堆积）只影响投递箱，汇合上报、对象/历史查询、归档完全不受影响 |
+
+```bash
+npm run verify:notify   # 94 项：成功回调/超时恢复/确认丢失重复/换钥边界/
+                        # 暂停积压/死信再发送/进程恢复/角色限制/慢回调隔离/
+                        # 冲突闭合+冷段事件/出箱崩溃窗口对账修复
+```
+
+### 订阅 HTTP 接口（均为 Bearer 令牌）
+
+| 方法与路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/subscriptions` | admin | 登记 `{name, callback_url, events[], signing_secret?}`；密钥留空自动生成，**仅本次响应返回** |
+| `GET /api/subscriptions` · `GET /api/subscriptions/:id` | admin / operator（只读） | 状态、待发送/死信数量、最近确认游标、密钥版本（不含密钥） |
+| `PATCH /api/subscriptions/:id` | admin | 改名称/回调地址/关注种类/状态 |
+| `POST /api/subscriptions/:id/pause` · `/resume` | admin | 暂停/恢复（已出箱批次与密钥版本不受影响） |
+| `POST /api/subscriptions/:id/rotate-key` | admin | 换签名密钥（新版本只约束之后入箱的批次；旧密钥保留） |
+| `GET /api/subscriptions/dead-letters` | admin / operator | 死信清单与原因 |
+| `POST /api/subscriptions/deliveries/:id/resend` | admin | 死信人工再发送（原事件标识、原顺序） |
+| `GET /api/subscriptions/events?object_key=&kind=` | admin / inspector | 脱敏通知证明（admin 额外含投递错误文本） |
+| `GET /api/subscriptions/events/:event_id` | admin / inspector | 单事件的各订阅投递证明 |
+| `POST /api/subscriptions/events/verify` | admin / inspector | 校验外部留存通知的签名与服务端事实一致性 |
+
+投递与退避的环境变量：`CONVERGE_DELIVERY_DISABLED=1`（关发送器仍入箱）、
+`CONVERGE_DELIVERY_TICK_MS`、`CONVERGE_DELIVERY_TIMEOUT_MS`、
+`CONVERGE_DELIVERY_MAX_ATTEMPTS`、`CONVERGE_DELIVERY_BACKOFF_BASE_MS`、
+`CONVERGE_DELIVERY_BACKOFF_CAP_MS`；管理员令牌由 `ADMIN_TOKEN`（默认 `admin-token`）覆盖。
+
 ## 角色与令牌
 
 | 角色 | 默认令牌 | 权限 |
@@ -76,9 +120,10 @@ npm run verify:archive  # 归档 96 项（见上“可验证的历史压缩与�
 | operator | `operator-token` | 上报信封、查看对象/版本图/挂起原因、查看案件与回执 |
 | reviewer-01 | `reviewer1-token` | 查看对象/案件、提交第一复核 |
 | reviewer-02 | `reviewer2-token` | 查看对象/案件、提交第二复核（须与一审人不同） |
-| inspector | `inspector-token` | 仅查询/下载脱敏收据、校验收据；看不到站点、请求键、序号 |
+| inspector | `inspector-token` | 仅查询/下载脱敏收据、校验收据；查询/校验脱敏通知证明；看不到站点、请求键、序号 |
+| admin | `admin-token` | 登记/暂停/恢复/轮换事件订阅、查看投递状态与死信、人工再发送、校验通知证明 |
 
-生产环境通过 `OPERATOR_TOKEN` / `REVIEWER1_TOKEN` / `REVIEWER2_TOKEN` / `INSPECTOR_TOKEN` 覆盖。
+生产环境通过 `OPERATOR_TOKEN` / `REVIEWER1_TOKEN` / `REVIEWER2_TOKEN` / `INSPECTOR_TOKEN` / `ADMIN_TOKEN` 覆盖。
 
 ## HTTP 接口
 

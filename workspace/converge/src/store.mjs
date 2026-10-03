@@ -3,6 +3,7 @@ import { Wal } from './wal.mjs';
 import { Mutex } from './mutex.mjs';
 import { canonical, digestOf, sha256Hex, sign } from './crypto-util.mjs';
 import { ArchiveManager, ArchiveError, isFsPermissionError } from './archive.mjs';
+import { Notifier, T_EVENT, T_DELIVERY } from './notifier.mjs';
 
 export class ApiError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -49,6 +50,7 @@ export class ConvergenceStore {
     this.wal = new Wal(config.walPath);
     this.lock = new Mutex();
     this.archive = new ArchiveManager(config);
+    this.notifier = new Notifier(config);
 
     this.nodes = new Map(); // digest -> node
     this.objects = new Map(); // objectKey -> object state
@@ -90,12 +92,27 @@ export class ConvergenceStore {
     this._pruneHotToCold();
     this._rebuildDerived();
     this._recoverSettlements();
+    this._reconcileOutbox(events);
+
+    // HTTP delivery starts only once every durable state is rebuilt.
+    this.notifier.bindStore(this);
+    this.notifier.start();
   }
 
   close() {
+    this.notifier.stop();
     for (const t of this._timers.values()) clearTimeout(t);
     this._timers.clear();
     this.wal.close();
+  }
+
+  /**
+   * Append notification frames durably under the process mutex. Called by the
+   * Notifier for subscription admin and delivery state transitions; business
+   * code uses _commitFramesWithFacts() so business + outbox land in one fsync.
+   */
+  commitNotificationFrames(frames) {
+    this.wal.appendMany(frames);
   }
 
   // ---------------------------------------------------------------- replay --
@@ -108,6 +125,10 @@ export class ConvergenceStore {
     if (type === T_RESTORED) {
       const wrap = JSON.parse(payloadBuf.toString('utf8'));
       for (const e of wrap.events || []) this._replay(e.t, Buffer.from(e.p, 'utf8'));
+      return;
+    }
+    if (type === T_EVENT || type === T_DELIVERY) {
+      this.notifier.replayFrame(type, payloadBuf);
       return;
     }
     this._replay(type, payloadBuf);
@@ -164,6 +185,91 @@ export class ConvergenceStore {
     this.nodes.set(node.digest, node);
     this.siteSeqs.set(`${node.object_key}|${node.site}|${node.site_seq}`, node.digest);
     this.requestIndex.set(node.request_key, { body_hash: ev.body_hash, node_digest: node.digest });
+  }
+
+  // ------------------------------------------------- outbox reconciliation --
+
+  /** Fact descriptor for a durable decision (never contains site/request data). */
+  _decisionFact(node, receipt, extraDetail = {}) {
+    return {
+      kind: 'decision.created',
+      object_key: node.object_key,
+      cursor: receipt.seq,
+      cursor_name: 'receipt_seq',
+      fact_key: receipt.hash,
+      detail: {
+        decision_kind: node.decision_kind,
+        decision_node: node.digest,
+        receipt_hash: receipt.hash,
+        ...extraDetail,
+      },
+      occurred_at: receipt.emitted_at,
+    };
+  }
+
+  /** Conflict-closure fact for an adjudicated case. */
+  _conflictClosedFact(node, receipt) {
+    return {
+      kind: 'conflict.closed',
+      object_key: node.object_key,
+      cursor: receipt.seq,
+      cursor_name: 'receipt_seq',
+      fact_key: `conflict:${node.case_id}:${receipt.hash}`,
+      detail: {
+        case_id: node.case_id,
+        decision_node: node.digest,
+        receipt_hash: receipt.hash,
+        decision_kind: 'adjudicate',
+      },
+      occurred_at: receipt.emitted_at,
+    };
+  }
+
+  /** Cold-segment fact for a durable checkpoint stub. */
+  _coldSegmentFact(stub) {
+    return {
+      kind: 'cold_segment.generated',
+      object_key: stub.object_key,
+      cursor: stub.boundary_seq,
+      cursor_name: 'boundary_receipt_seq',
+      fact_key: stub.segment_id,
+      detail: {
+        segment_id: stub.segment_id,
+        boundary_seq: stub.boundary_seq,
+        chain_anchor: stub.chain_anchor,
+      },
+      occurred_at: stub.created_at,
+    };
+  }
+
+  /**
+   * Repair the residual crash window: scan every durable business fact (hot
+   * decision frames — including ones inside T_RESTORED wrappers — and checkpoint
+   * stubs) and ensure an event exists for each in the notifier log. With the
+   * single-fsync _commitWithEvent this set is normally empty; the scan is what
+   * makes "business committed but never enqueued" structurally impossible.
+   */
+  _reconcileOutbox(rawEvents) {
+    const facts = [];
+    for (const ev of rawEvents) {
+      if (ev.type === T_DECISION) {
+        const e = JSON.parse(ev.payload.toString('utf8'));
+        facts.push(this._decisionFact(e.node, e.receipt));
+        if (e.node.decision_kind === 'adjudicate') facts.push(this._conflictClosedFact(e.node, e.receipt));
+      } else if (ev.type === T_RESTORED) {
+        const wrap = JSON.parse(ev.payload.toString('utf8'));
+        for (const x of wrap.events || []) {
+          if (x.t !== T_DECISION) continue;
+          const e = JSON.parse(x.p);
+          facts.push(this._decisionFact(e.node, e.receipt));
+          if (e.node.decision_kind === 'adjudicate') facts.push(this._conflictClosedFact(e.node, e.receipt));
+        }
+      } else if (ev.type === T_CHECKPOINT) {
+        const stub = JSON.parse(ev.payload.toString('utf8'));
+        facts.push(this._coldSegmentFact(stub));
+      }
+    }
+    if (facts.length) this.notifier.reconcile(facts, (frames) => this.wal.appendMany(frames));
   }
 
   // ------------------------------------------------- cold index from stubs --
@@ -360,6 +466,13 @@ export class ConvergenceStore {
         let key = null;
         try { key = JSON.parse(f.payload.toString('utf8')).object_key; } catch { /* keep malformed */ }
         if (key !== null && lastStubByObject.get(key) !== f) continue; // superseded copy
+        keep.push({ type: f.type, payload: f.payload });
+        continue;
+      }
+      // The event log and the per-subscription inboxes are delivery state, not
+      // object history: a checkpoint rotation must never drop them (otherwise a
+      // restart would forget unconfirmed notifications and the event registry).
+      if (f.type === T_EVENT || f.type === T_DELIVERY) {
         keep.push({ type: f.type, payload: f.payload });
         continue;
       }
@@ -883,7 +996,15 @@ export class ConvergenceStore {
     const hash = digestOf(receiptFields);
     const receipt = { ...receiptFields, hash, sig: sign(this.config.receiptSecret, receiptFields) };
 
-    this.wal.append(T_DECISION, JSON.stringify({ node, receipt }));
+    // The decision frame and its notification frames are one durable result
+    // (one write, one fsync): a settled/closed business fact can never exist
+    // without its downstream event already in the inbox. Adjudication closes a
+    // conflict, which is a SECOND event committed in the same atomic batch.
+    const businessFrame = { type: T_DECISION, payload: JSON.stringify({ node, receipt }) };
+    const facts = [this._decisionFact(node, receipt, adjudication ? { case_id: adjudication.caseId } : {})];
+    if (adjudication) facts.push(this._conflictClosedFact(node, receipt));
+    this._commitFramesWithFacts(businessFrame, facts);
+
     this.nodes.set(node.digest, node);
     this.receipts.set(hash, receipt);
     this.receiptSeq.set(objectKey, seq);
@@ -896,6 +1017,22 @@ export class ConvergenceStore {
       obj.openCaseId = null;
     }
     return node;
+  }
+
+  /**
+   * Commit one business frame together with all notification frames the given
+   * facts produce, in a single fsync, then mirror everything into live state.
+   */
+  _commitFramesWithFacts(businessFrame, facts) {
+    const frames = [businessFrame];
+    const plans = [];
+    for (const fact of facts) {
+      const plan = this.notifier.plan(fact);
+      if (plan.eventFrame) frames.push(plan.eventFrame, ...plan.enqueueFrames);
+      plans.push(plan);
+    }
+    this.wal.appendMany(frames);
+    for (const plan of plans) this.notifier.afterAppend(plan);
   }
 
   _receiptByNode(nodeDigest) {
@@ -1067,6 +1204,19 @@ export class ConvergenceStore {
    * restart, so this pass replaces it.
    */
   _recoverSettlements() {
+    // During startup replay the notifier inbox is already populated from T_EVENT
+    // frames, but the sender must stay off until recovery finishes (and any
+    // missing facts are reconciled) — see open().
+    const wasStopped = this.notifier._stopped;
+    this.notifier._stopped = true;
+    try {
+      this._recoverSettlementsLocked();
+    } finally {
+      this.notifier._stopped = wasStopped;
+    }
+  }
+
+  _recoverSettlementsLocked() {
     for (const node of this.nodes.values()) {
       if (node.kind === 'change' && this._missingPreds(node).length === 0) node._resolved = true;
     }
@@ -1330,7 +1480,12 @@ export class ConvergenceStore {
 
     // The stub append is the durable commit point: after it lands, the trim must
     // complete even if the process exits — startup recovery finishes the job.
-    this.wal.append(T_CHECKPOINT, JSON.stringify(stub));
+    // The cold_segment.generated event is part of that SAME atomic append, so a
+    // generated cold segment is always accompanied by a durable notification.
+    this._commitFramesWithFacts(
+      { type: T_CHECKPOINT, payload: JSON.stringify(stub) },
+      [this._coldSegmentFact(stub)],
+    );
     this.archive.updateTaskMarker(taskId, { phase: 'VERIFIED' });
     this._indexCheckpointStub(stub);
 
@@ -2094,5 +2249,44 @@ export class ConvergenceStore {
         throw e;
       }
     });
+  }
+
+  // ============================================================= SUBSCRIPTIONS
+  // All management runs under the process mutex, like every other mutation, so
+  // subscription snapshots are durably ordered against in-flight business frames.
+
+  async createSubscription(body) {
+    return this.lock.runExclusive(() => this.notifier.createSubscription(body));
+  }
+  async listSubscriptions(view) {
+    return this.lock.runExclusive(() => this.notifier.listSubscriptions(view));
+  }
+  async getSubscription(id) {
+    return this.lock.runExclusive(() => this.notifier.getSubscription(id));
+  }
+  async updateSubscription(id, patch) {
+    return this.lock.runExclusive(() => this.notifier.updateSubscription(id, patch));
+  }
+  async rotateSubscriptionKey(id, body) {
+    return this.lock.runExclusive(() => this.notifier.rotateKey(id, body));
+  }
+  async resendDeadLetter(deliveryId) {
+    return this.lock.runExclusive(() => this.notifier.resendDead(deliveryId));
+  }
+  async listDeadLetters() {
+    return this.lock.runExclusive(() => this.notifier.listDeadLetters());
+  }
+  async listNotificationProofs(query) {
+    return this.lock.runExclusive(() => this.notifier.listProofs(query));
+  }  async getNotificationProof(eventId, opts) {
+    return this.lock.runExclusive(() => this.notifier.proofForEvent(eventId, opts));
+  }
+  async verifyNotificationProof(body) {
+    return this.lock.runExclusive(() => this.notifier.verifyProof(body));
+  }
+
+  /** Drive one delivery pass synchronously (tests / manual pump). */
+  async pumpDeliveries() {
+    return this.notifier.tick();
   }
 }

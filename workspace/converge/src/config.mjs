@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-export const ROLES = ['operator', 'reviewer', 'inspector'];
+export const ROLES = ['operator', 'reviewer', 'inspector', 'admin'];
 
 /**
  * Static role tokens. Override via environment for deployment; defaults exist so
@@ -25,11 +25,23 @@ export function loadConfig(env = process.env) {
     //   'after_segment'  process-exit-equivalent failure once the segment exists
     //   'after_stub'     failure once the checkpoint stub is durable, pre-trim
     crashPoint: env.CONVERGE_CRASH_POINT || null,
+    // Downstream event subscription delivery tuning.
+    delivery: {
+      enabled: env.CONVERGE_DELIVERY_DISABLED !== '1',
+      tickMs: Math.max(1, Number(env.CONVERGE_DELIVERY_TICK_MS || 100)),
+      timeoutMs: Math.max(50, Number(env.CONVERGE_DELIVERY_TIMEOUT_MS || 3000)),
+      maxAttempts: Math.max(1, Number(env.CONVERGE_DELIVERY_MAX_ATTEMPTS || 5)),
+      // Base delay for the capped exponential backoff (delay = base*2^(n-1),
+      // capped at capMs). Tests override the base to run without wall-clock waits.
+      backoffBaseMs: Math.max(0, Number(env.CONVERGE_DELIVERY_BACKOFF_BASE_MS || 200)),
+      backoffCapMs: Math.max(0, Number(env.CONVERGE_DELIVERY_BACKOFF_CAP_MS || 30000)),
+    },
     tokens: {
       [env.OPERATOR_TOKEN || 'operator-token']: 'operator',
       [env.REVIEWER1_TOKEN || 'reviewer1-token']: 'reviewer',
       [env.REVIEWER2_TOKEN || 'reviewer2-token']: 'reviewer',
       [env.INSPECTOR_TOKEN || 'inspector-token']: 'inspector',
+      [env.ADMIN_TOKEN || 'admin-token']: 'admin',
     },
     reviewerIdentities: {
       [env.REVIEWER1_TOKEN || 'reviewer1-token']: env.REVIEWER1_NAME || 'reviewer-01',

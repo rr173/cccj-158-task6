@@ -75,10 +75,11 @@
     操作员令牌
     <select id="tokenSelect">
       <option value="">— 选择身份 —</option>
-      <option value="operator-token">operator（上报 / 看图谱）</option>
+      <option value="operator-token">operator（上报 / 看图谱 / 订阅只读）</option>
       <option value="reviewer1-token">reviewer-01（一审）</option>
       <option value="reviewer2-token">reviewer-02（二审）</option>
-      <option value="inspector-token">inspector（只查脱敏收据）</option>
+      <option value="inspector-token">inspector（脱敏收据 / 通知证明）</option>
+      <option value="admin-token">admin（事件订阅管理 / 死信再发送）</option>
     </select>
   </label>
   <input type="password" id="tokenInput" placeholder="或直接粘贴令牌" style="width:210px" />
@@ -156,6 +157,36 @@
     <section class="panel" id="proofsPanel" hidden>
       <h2>脱敏归档证明</h2>
       <div id="proofsList" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="subsPanel" hidden>
+      <h2>下游合规事件订阅</h2>
+      <div id="subsAdminOps" style="margin-bottom:10px;">
+        <div class="row">
+          <input type="text" id="subName" placeholder="订阅名称 name" />
+          <input type="text" id="subUrl" placeholder="回调地址 https://…" />
+        </div>
+        <div class="row" style="margin-top:6px;">
+          <label style="margin:0; display:flex; gap:6px; align-items:center;"><input type="checkbox" id="evDecision" checked /> decision.created</label>
+          <label style="margin:0; display:flex; gap:6px; align-items:center;"><input type="checkbox" id="evConflict" checked /> conflict.closed</label>
+          <label style="margin:0; display:flex; gap:6px; align-items:center;"><input type="checkbox" id="evCold" /> cold_segment.generated</label>
+        </div>
+        <div style="margin-top:8px;">
+          <button id="subCreateBtn" type="button">登记订阅</button>
+          <span class="muted" style="margin-left:8px;">签名密钥留空则自动生成；通知内容仅含稳定标识/对象键/种类/业务游标/签名。</span>
+        </div>
+        <pre id="subCreateResult" hidden></pre>
+      </div>
+      <div id="subsList" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="notifyProofsPanel" hidden>
+      <h2>脱敏通知证明</h2>
+      <div class="row">
+        <input type="text" id="notifyFilter" placeholder="按对象键过滤（可空）" />
+        <button id="loadNotifyProofs" class="ghost" type="button">查询</button>
+      </div>
+      <div id="notifyProofsList" class="muted" style="margin-top:10px;">加载中…</div>
     </section>
 
     <section class="panel" id="detailPanel" hidden>
